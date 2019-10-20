@@ -101,7 +101,7 @@ using NETIO_STATUS = LONG;
 
 static const char PEER_ID[] = "qB";
 static const char RESUME_FOLDER[] = "BT_backup";
-static const char USER_AGENT[] = "µTorrent 3.4.8.42576";
+static const char USER_AGENT[] = "BitTorrent/7100(255961997)(43917)";
 
 using namespace BitTorrent;
 
