@@ -129,6 +129,8 @@ namespace BitTorrent
         Error
     };
 
+    uint qHash(TorrentState key, uint seed);
+
     class TorrentHandle : public QObject
     {
         Q_DISABLE_COPY(TorrentHandle)
@@ -271,7 +273,7 @@ namespace BitTorrent
         qlonglong activeTime() const;
         qlonglong finishedTime() const;
         qlonglong seedingTime() const;
-        qulonglong eta() const;
+        qlonglong eta() const;
         QVector<qreal> filesProgress() const;
         int seedsCount() const;
         int peersCount() const;
@@ -324,7 +326,7 @@ namespace BitTorrent
         void setUploadLimit(int limit);
         void setDownloadLimit(int limit);
         void setSuperSeeding(bool enable);
-        void flushCache();
+        void flushCache() const;
         void addTrackers(const QVector<TrackerEntry> &trackers);
         void replaceTrackers(const QVector<TrackerEntry> &trackers);
         void addUrlSeeds(const QVector<QUrl> &urlSeeds);

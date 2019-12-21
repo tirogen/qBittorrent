@@ -177,6 +177,11 @@ CreateTorrentParams::CreateTorrentParams(const AddTorrentParams &params)
         savePath = Session::instance()->defaultSavePath();
 }
 
+uint BitTorrent::qHash(const BitTorrent::TorrentState key, const uint seed)
+{
+    return ::qHash(static_cast<std::underlying_type_t<TorrentState>>(key), seed);
+}
+
 // TorrentHandle
 
 const qreal TorrentHandle::USE_GLOBAL_RATIO = -2.;
@@ -303,7 +308,7 @@ qlonglong TorrentHandle::totalSize() const
     return m_torrentInfo.totalSize();
 }
 
-// get the size of the torrent without the filtered files
+// size without the "don't download" files
 qlonglong TorrentHandle::wantedSize() const
 {
     return m_nativeStatus.total_wanted;
@@ -569,7 +574,7 @@ bool TorrentHandle::needSaveResumeData() const
 
 void TorrentHandle::saveResumeData()
 {
-    m_nativeHandle.save_resume_data(lt::torrent_handle::save_info_dict);
+    m_nativeHandle.save_resume_data();
     m_session->handleTorrentSaveResumeDataRequested(this);
 }
 
@@ -899,7 +904,10 @@ TorrentState TorrentHandle::state() const
 
 void TorrentHandle::updateState()
 {
-    if (m_nativeStatus.state == lt::torrent_status::checking_resume_data) {
+    if (hasError()) {
+        m_state = TorrentState::Error;
+    }
+    else if (m_nativeStatus.state == lt::torrent_status::checking_resume_data) {
         m_state = TorrentState::CheckingResumeData;
     }
     else if (isMoveInProgress()) {
@@ -908,8 +916,6 @@ void TorrentHandle::updateState()
     else if (isPaused()) {
         if (hasMissingFiles())
             m_state = TorrentState::MissingFiles;
-        else if (hasError())
-            m_state = TorrentState::Error;
         else
             m_state = isSeed() ? TorrentState::PausedUploading : TorrentState::PausedDownloading;
     }
@@ -961,12 +967,7 @@ bool TorrentHandle::hasMissingFiles() const
 
 bool TorrentHandle::hasError() const
 {
-#if (LIBTORRENT_VERSION_NUM < 10200)
-    return (m_nativeStatus.paused && m_nativeStatus.errc);
-#else
-    return ((m_nativeStatus.flags & lt::torrent_flags::paused)
-            && m_nativeStatus.errc);
-#endif
+    return static_cast<bool>(m_nativeStatus.errc);
 }
 
 bool TorrentHandle::hasFilteredPieces() const
@@ -1031,7 +1032,7 @@ qlonglong TorrentHandle::seedingTime() const
 #endif
 }
 
-qulonglong TorrentHandle::eta() const
+qlonglong TorrentHandle::eta() const
 {
     if (isPaused()) return MAX_ETA;
 
@@ -1071,7 +1072,11 @@ qulonglong TorrentHandle::eta() const
 
 QVector<qreal> TorrentHandle::filesProgress() const
 {
+#if (LIBTORRENT_VERSION_NUM < 10200)
     std::vector<boost::int64_t> fp;
+#else
+    std::vector<int64_t> fp;
+#endif
     m_nativeHandle.file_progress(fp, lt::torrent_handle::piece_granularity);
 
     const int count = static_cast<int>(fp.size());
@@ -1267,15 +1272,25 @@ int TorrentHandle::maxSeedingTime() const
 
 qreal TorrentHandle::realRatio() const
 {
+#if (LIBTORRENT_VERSION_NUM < 10200)
     const boost::int64_t upload = m_nativeStatus.all_time_upload;
     // special case for a seeder who lost its stats, also assume nobody will import a 99% done torrent
-    const boost::int64_t download = (m_nativeStatus.all_time_download < m_nativeStatus.total_done * 0.01) ? m_nativeStatus.total_done : m_nativeStatus.all_time_download;
+    const boost::int64_t download = (m_nativeStatus.all_time_download < (m_nativeStatus.total_done * 0.01))
+        ? m_nativeStatus.total_done
+        : m_nativeStatus.all_time_download;
+#else
+    const int64_t upload = m_nativeStatus.all_time_upload;
+    // special case for a seeder who lost its stats, also assume nobody will import a 99% done torrent
+    const int64_t download = (m_nativeStatus.all_time_download < (m_nativeStatus.total_done * 0.01))
+        ? m_nativeStatus.total_done
+        : m_nativeStatus.all_time_download;
+#endif
 
     if (download == 0)
-        return (upload == 0) ? 0.0 : MAX_RATIO;
+        return (upload == 0) ? 0 : MAX_RATIO;
 
     const qreal ratio = upload / static_cast<qreal>(download);
-    Q_ASSERT(ratio >= 0.0);
+    Q_ASSERT(ratio >= 0);
     return (ratio > MAX_RATIO) ? MAX_RATIO : ratio;
 }
 
@@ -1385,21 +1400,22 @@ void TorrentHandle::forceDHTAnnounce()
 
 void TorrentHandle::forceRecheck()
 {
-    if (m_startupState != Started) return;
     if (!hasMetadata()) return;
 
     m_nativeHandle.force_recheck();
     m_unchecked = false;
 
-    if (isPaused()) {
+    if ((m_startupState != Started) || isPaused()) {
 #if (LIBTORRENT_VERSION_NUM < 10200)
         m_nativeHandle.stop_when_ready(true);
 #else
         m_nativeHandle.set_flags(lt::torrent_flags::stop_when_ready);
 #endif
         setAutoManaged(true);
-        m_pauseWhenReady = true;
     }
+
+    if ((m_startupState == Started) && isPaused())
+        m_pauseWhenReady = true;
 }
 
 void TorrentHandle::setSequentialDownload(const bool enable)
@@ -1483,30 +1499,31 @@ void TorrentHandle::toggleFirstLastPiecePriority()
 
 void TorrentHandle::pause()
 {
-    if (m_startupState != Started) return;
-    if (m_pauseWhenReady) return;
-    if (isChecking()) {
-        m_pauseWhenReady = true;
-        return;
-    }
-
     if (isPaused()) return;
 
     setAutoManaged(false);
     m_nativeHandle.pause();
 
-    // Libtorrent doesn't emit a torrent_paused_alert when the
-    // torrent is queued (no I/O)
-    // We test on the cached m_nativeStatus
-    if (isQueued())
-        m_session->handleTorrentPaused(this);
+    if (m_startupState == Started) {
+        if (m_pauseWhenReady) {
+#if (LIBTORRENT_VERSION_NUM < 10200)
+            m_nativeHandle.stop_when_ready(false);
+#else
+            m_nativeHandle.unset_flags(lt::torrent_flags::stop_when_ready);
+#endif
+            m_pauseWhenReady = false;
+        }
+
+        // Libtorrent doesn't emit a torrent_paused_alert when the
+        // torrent is queued (no I/O)
+        // We test on the cached m_nativeStatus
+        if (isQueued())
+            m_session->handleTorrentPaused(this);
+    }
 }
 
 void TorrentHandle::resume(bool forced)
 {
-    if (m_startupState != Started) return;
-
-    m_pauseWhenReady = false;
     resume_impl(forced);
 }
 
@@ -1567,11 +1584,15 @@ bool TorrentHandle::saveTorrentFile(const QString &path)
 #endif
     const lt::entry torrentEntry = torrentCreator.generate();
 
-    QVector<char> out;
+    QByteArray out;
+    out.reserve(1024 * 1024);  // most torrent file sizes are under 1 MB
     lt::bencode(std::back_inserter(out), torrentEntry);
+    if (out.isEmpty())
+        return false;
+
     QFile torrentFile(path);
-    if (!out.empty() && torrentFile.open(QIODevice::WriteOnly))
-        return (torrentFile.write(&out[0], out.size()) == out.size());
+    if (torrentFile.open(QIODevice::WriteOnly))
+        return (torrentFile.write(out) == out.size());
 
     return false;
 }
@@ -2187,7 +2208,7 @@ void TorrentHandle::setSuperSeeding(const bool enable)
 #endif
 }
 
-void TorrentHandle::flushCache()
+void TorrentHandle::flushCache() const
 {
     m_nativeHandle.flush_cache();
 }
